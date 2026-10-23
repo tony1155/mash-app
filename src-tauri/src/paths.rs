@@ -7,6 +7,13 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 pub(crate) fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    // Headless/CLI runs (and isolated test environments) may relocate the
+    // data root via MASH_APP_DATA_DIR; the GUI never sets it.
+    if let Ok(dir) = std::env::var("MASH_APP_DATA_DIR") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).ok();
+        return dir;
+    }
     let dir = app
         .path()
         .app_data_dir()

@@ -54,9 +54,7 @@ fn bundled_adb_candidates(resource_dir: PathBuf) -> Vec<PathBuf> {
 }
 
 pub(crate) fn resolve_adb_path(app: &tauri::AppHandle) -> PathBuf {
-    app.path()
-        .resource_dir()
-        .ok()
+    crate::resource_base_dir(app)
         .and_then(|dir| {
             bundled_adb_candidates(dir)
                 .into_iter()

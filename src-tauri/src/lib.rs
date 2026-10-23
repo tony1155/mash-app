@@ -2,6 +2,7 @@ mod adb;
 mod automation_error;
 mod battle_statistics;
 mod commands;
+pub mod cli;
 mod craft_essence_enhancement_runner;
 mod device_operation;
 mod enhancement_runner;

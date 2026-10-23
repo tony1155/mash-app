@@ -2,6 +2,24 @@
 
 use super::*;
 
+/// Resolve the base resource directory, honoring an explicit override first.
+///
+/// `MASH_RESOURCE_DIR` lets headless deployments (mash-cli) and portable
+/// installs point at the directory that contains the bundled `resources/`
+/// tree (normally the GUI install directory next to `Mash.exe`). When unset
+/// the resolver falls back to Tauri's `resource_dir()`, which resolves
+/// relative to the running executable.
+pub(crate) fn resource_base_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("MASH_RESOURCE_DIR") {
+        let path = PathBuf::from(&dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+        eprintln!("[resources] MASH_RESOURCE_DIR={dir} 不是有效目录，回退默认资源解析");
+    }
+    app.path().resource_dir().ok()
+}
+
 /// Resolve the bundled templates directory for the given server. Each
 /// server (JP/CN) ships its own subtree under
 /// `resources/servers/{token}/templates/` so flipping the global server
@@ -20,7 +38,7 @@ pub(crate) fn resolve_templates_dir(app: &tauri::AppHandle, server: Server) -> O
         }
     }
 
-    let base = app.path().resource_dir().ok()?;
+    let base = resource_base_dir(app)?;
     Some(
         base.join("resources")
             .join("servers")
@@ -43,7 +61,7 @@ pub(crate) fn resolve_shared_templates_dir(app: &tauri::AppHandle) -> Option<Pat
         }
     }
 
-    let base = app.path().resource_dir().ok()?;
+    let base = resource_base_dir(app)?;
     Some(
         base.join("resources")
             .join("servers")
@@ -86,7 +104,7 @@ pub(crate) fn resolve_cv_config_path(app: &tauri::AppHandle, server: Server) -> 
         }
     }
 
-    let base = app.path().resource_dir().ok()?;
+    let base = resource_base_dir(app)?;
     Some(
         base.join("resources")
             .join("servers")
@@ -108,7 +126,7 @@ pub(crate) fn resolve_shared_cv_config_path(app: &tauri::AppHandle) -> Option<Pa
         }
     }
 
-    let base = app.path().resource_dir().ok()?;
+    let base = resource_base_dir(app)?;
     Some(
         base.join("resources")
             .join("servers")
@@ -144,7 +162,7 @@ pub(crate) fn resolve_resource_image_path(
         }
     }
 
-    if let Ok(base) = app.path().resource_dir() {
+    if let Some(base) = resource_base_dir(app) {
         let bundled = base.join("resources").join("images").join(file_name);
         if bundled.is_file() {
             return Some(bundled);
@@ -193,7 +211,7 @@ mod catalog_path_tests {
 
 /// Resolve the bundled scrcpy-server.jar path.
 pub(crate) fn resolve_scrcpy_jar(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let base = app.path().resource_dir().ok()?;
+    let base = resource_base_dir(app)?;
     Some(
         base.join("resources")
             .join("scrcpy")
@@ -219,7 +237,7 @@ pub(crate) fn resolve_servant_assets_dir(app: &tauri::AppHandle) -> Option<PathB
     if imported.is_dir() {
         return Some(imported);
     }
-    if let Ok(base) = app.path().resource_dir() {
+    if let Some(base) = resource_base_dir(app) {
         let bundled = base.join("assets").join("servants");
         if bundled.is_dir() {
             return Some(bundled);
@@ -245,7 +263,7 @@ pub(crate) fn resolve_ce_assets_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     if imported.is_dir() {
         return Some(imported);
     }
-    if let Ok(base) = app.path().resource_dir() {
+    if let Some(base) = resource_base_dir(app) {
         let bundled = base.join("assets").join("ces");
         if bundled.is_dir() {
             return Some(bundled);
@@ -266,7 +284,7 @@ pub(crate) fn resolve_item_icons_dir(app: &tauri::AppHandle) -> Option<PathBuf> 
     if imported.is_dir() {
         return Some(imported);
     }
-    if let Ok(base) = app.path().resource_dir() {
+    if let Some(base) = resource_base_dir(app) {
         let bundled = base.join("assets/icons/items");
         if bundled.is_dir() {
             return Some(bundled);
@@ -281,7 +299,7 @@ pub(crate) fn resolve_mystic_code_assets_dir(app: &tauri::AppHandle) -> Option<P
     if imported.is_dir() {
         return Some(imported);
     }
-    if let Ok(base) = app.path().resource_dir() {
+    if let Some(base) = resource_base_dir(app) {
         let bundled = base.join("assets").join("mystic-codes");
         if bundled.is_dir() {
             return Some(bundled);
@@ -318,7 +336,7 @@ pub(crate) fn resolve_sidecar_code_dir(app: &tauri::AppHandle) -> Option<PathBuf
         }
     }
 
-    let resources = app.path().resource_dir().ok()?;
+    let resources = resource_base_dir(app)?;
     bundled_code_dir(&resources)
 }
 

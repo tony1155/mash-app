@@ -101,10 +101,7 @@ pub(crate) fn parse_runtime_manifest(contents: &str) -> Result<RuntimeManifest, 
 }
 
 pub(crate) fn runtime_manifest(app: &tauri::AppHandle) -> Result<RuntimeManifest, String> {
-    let contents = app
-        .path()
-        .resource_dir()
-        .ok()
+    let contents = resource_base_dir(app)
         .map(|base| base.join("resources").join("runtime-manifest.json"))
         .and_then(|path| fs::read_to_string(path).ok())
         .unwrap_or_else(|| RUNTIME_MANIFEST_JSON.to_string());

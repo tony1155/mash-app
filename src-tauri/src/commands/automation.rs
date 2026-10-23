@@ -279,7 +279,7 @@ pub(crate) fn start_rank_up_quest_automation(
     start_automation_with_config(&app, config, &handle_state, &coordinator, &debug_state)
 }
 
-fn start_automation_with_config(
+pub(crate) fn start_automation_with_config(
     app: &tauri::AppHandle,
     mut config: RunConfig,
     handle_state: &Mutex<RunnerHandle>,
