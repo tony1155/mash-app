@@ -121,8 +121,9 @@ Exit codes（Orchestrator 判据）：
 
 ## 5. `status` —— 查询当前/最近一次 run
 
-- 读 `cli/current.json`（存在且 pid 活着 → `{"running":true,…}`）+ `cli/last-run.json`。
-- `{"running":false,"lastRun":{…run-result…}}`。
+- 读 `cli/current.json` 并对记录的 pid 探活（活着 → `{"running":true,"current":{…}}`）+ `cli/last-run.json`。
+- `{"running":false,"stale":false,"current":null,"lastRun":{…run-result…}}`。
+- `stale=true` 表示发现记录但 pid 已不存在（硬杀/崩溃残留）：`current` 为 null，记录已自动清理。
 - Orchestrator 主要在异常恢复时用它做对账（例如 Orchestrator 崩溃重启后确认 Mash 是否还在跑）。
 
 ## 6. 辅助命令

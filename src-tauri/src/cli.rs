@@ -506,7 +506,7 @@ fn print_json(value: &Value, _args: &Args) {
 // run
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunOutcome {
     Finished,
     Error,
@@ -533,6 +533,29 @@ impl RunOutcome {
             Self::Cancelled => EXIT_CANCELLED,
             Self::Timeout => EXIT_TIMEOUT,
         }
+    }
+}
+
+/// Map the runner's final state to the CLI outcome.
+///
+/// `watchdog_fired` marks a stop that the watchdog itself initiated (audit
+/// round 2, P1-1N): the engine honouring the cancel request lands in `Idle`,
+/// which is a *timeout* semantically — reporting it as `cancelled` makes the
+/// orchestrator skip managed MuMu cleanup and report the run as cancelled
+/// instead of timed out. `Finished` stays `Finished`: a quota that genuinely
+/// completed before the cancel took effect is a completion, not a timeout.
+fn final_outcome(final_state: &RunnerState, watchdog_fired: bool) -> RunOutcome {
+    match final_state {
+        RunnerState::Finished => RunOutcome::Finished,
+        RunnerState::Error { .. } => RunOutcome::Error,
+        RunnerState::Idle => {
+            if watchdog_fired {
+                RunOutcome::Timeout
+            } else {
+                RunOutcome::Cancelled
+            }
+        }
+        RunnerState::Starting | RunnerState::Running => RunOutcome::Error,
     }
 }
 
@@ -1273,15 +1296,19 @@ fn command_run(app: &tauri::App<tauri::Wry>, args: &Args) -> i32 {
     }
 
     let final_state = runner_state.lock().unwrap().state.lock().unwrap().clone();
-    let outcome = match (&final_state, terminal.is_some()) {
-        (RunnerState::Finished, _) => RunOutcome::Finished,
-        (RunnerState::Error { .. }, _) | (_, true) => RunOutcome::Error,
-        (RunnerState::Idle, _) => RunOutcome::Cancelled,
-        _ => RunOutcome::Error,
-    };
+    // 审计二轮 P1-1N：watchdog 发起的停止在语义上就是超时——引擎响应取消
+    // 优雅收尾（主流形态）时终态是 Idle，必须映射为 Timeout/exit 3，否则
+    // 整条编排链会把超时报成 CANCELLED（managed MuMu 清理被连带跳过）。
+    // Finished 是唯一例外：取消生效前配额真实跑完，如实上报完成。
+    let watchdog_fired = watchdog_hard_deadline.is_some();
+    let outcome = final_outcome(&final_state, watchdog_fired);
+    let message = terminal.or_else(|| {
+        (watchdog_fired && matches!(outcome, RunOutcome::Timeout))
+            .then(|| "watchdog 超时：已请求停止，引擎按契约优雅收尾".to_string())
+    });
     let (result, code) = finish(
         outcome,
-        terminal,
+        message,
         Some(project),
         device_used,
         server,
@@ -1518,6 +1545,27 @@ mod tests {
     #[test]
     fn own_pid_is_reported_alive() {
         assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn watchdog_fired_idle_maps_timeout_not_cancelled() {
+        // 审计二轮 P1-1N：watchdog 发起的停止必须报超时，否则编排链
+        // 把主流超时形态误报为取消并跳过 managed MuMu 清理。
+        assert_eq!(
+            final_outcome(&RunnerState::Idle, true),
+            RunOutcome::Timeout
+        );
+        // 配额在取消生效前真实完成 → 仍是完成。
+        assert_eq!(
+            final_outcome(&RunnerState::Finished, true),
+            RunOutcome::Finished
+        );
+        // 外部取消（Ctrl+C / mash-cli cancel）与失败不受 watchdog 标志影响。
+        assert_eq!(
+            final_outcome(&RunnerState::Idle, false),
+            RunOutcome::Cancelled
+        );
+        assert_eq!(final_outcome(&RunnerState::Error { message: String::new() }, false), RunOutcome::Error);
     }
 
     #[test]
