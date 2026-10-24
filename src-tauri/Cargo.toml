@@ -41,3 +41,14 @@ path = "src/bin/mash-cli.rs"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
+# mash-cli only: PID liveness probing + kill-on-close Job Object for the
+# headless process (audit P0-1 / P1-3). Version matches the one already in
+# the dependency tree via tauri.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects",
+] }

@@ -74,6 +74,7 @@ const EXIT_USAGE: i32 = 64;
 // ---------------------------------------------------------------------------
 
 pub fn cli_main() -> i32 {
+    confine_to_kill_on_close_job();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
         eprint!("{USAGE}");
@@ -799,6 +800,99 @@ impl Drop for CurrentRunGuard {
     }
 }
 
+/// Best-effort liveness probe for the PID recorded in `current.json`.
+///
+/// Windows uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
+/// `GetExitCodeProcess`; other platforms fall back to `ps -p`. A PID we
+/// cannot open is treated as dead — falsely flagging a stale record only
+/// costs a warning, while missing a dead one blocks every future run
+/// (audit P0-1).
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let probed = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            probed != 0 && exit_code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Read `current.json` and decide whether it represents a live run.
+/// `None` means the file is missing or unreadable/unparseable.
+fn read_current_run(files: &CliRunFiles) -> Option<(Value, bool)> {
+    let record = read_json(&files.current())?;
+    let pid = record["pid"].as_u64().unwrap_or(0) as u32;
+    Some((record, pid_alive(pid)))
+}
+
+/// Remove a stale run record (and any pending cancel request) after the
+/// recorded PID turned out to be dead.
+fn clear_stale_run(files: &CliRunFiles) {
+    let _ = std::fs::remove_file(files.current());
+    let _ = std::fs::remove_file(files.cancel_request());
+}
+
+/// Windows: confine this process to a kill-on-close Job Object so that any
+/// exit path — including the watchdog's `std::process::exit`, which does not
+/// run destructors — tears down spawned children such as the mash-cv python
+/// sidecar instead of leaking them (audit P1-3). The job handle is
+/// deliberately kept open for the process lifetime; the OS closes it on exit,
+/// which triggers `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+#[cfg(target_os = "windows")]
+fn confine_to_kill_on_close_job() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if configured != 0 && AssignProcessToJobObject(job, GetCurrentProcess()) != 0 {
+            // Intentionally leak the handle: closing it here would trigger
+            // the kill-on-close semantics immediately.
+            return;
+        }
+        CloseHandle(job);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn confine_to_kill_on_close_job() {}
+
 fn emit_stdout(line: &str, enabled: bool) {
     if enabled {
         println!("{line}");
@@ -925,8 +1019,25 @@ fn command_run(app: &tauri::App<tauri::Wry>, args: &Args) -> i32 {
         return EXIT_ERROR;
     }
     if files.current().exists() {
-        eprintln!("已有正在运行的 mash-cli run（{}）", files.current().display());
-        return EXIT_ERROR;
+        // Audit P0-1: a hard-killed or crashed run leaves current.json
+        // behind; only refuse when the recorded PID is still alive.
+        match read_current_run(&files) {
+            Some((_, true)) => {
+                eprintln!("已有正在运行的 mash-cli run（{}）", files.current().display());
+                return EXIT_ERROR;
+            }
+            Some((record, false)) => {
+                eprintln!(
+                    "[mash-cli] 检测到陈旧 run 记录（pid {}，进程已退出），已清理后继续",
+                    record["pid"].as_u64().unwrap_or(0)
+                );
+                clear_stale_run(&files);
+            }
+            None => {
+                eprintln!("run 记录损坏（{}），已清理后继续", files.current().display());
+                clear_stale_run(&files);
+            }
+        }
     }
     let device_used = device_override.clone().or_else(|| {
         app.state::<Mutex<settings::AdbDeviceSettings>>()
@@ -1121,8 +1232,11 @@ fn command_run(app: &tauri::App<tauri::Wry>, args: &Args) -> i32 {
                 );
                 write_result_files(&files, &result, args);
                 emit_stdout(&result_with_type(result, "result"), events_enabled);
-                // The runner thread may still hold the device; exit hard so
-                // the orchestrator can run its recovery path.
+                // process::exit 不运行 Drop：显式清理 run 记录，避免残留
+                // 阻塞后续 run（audit P0-1 触发路径 1）。sidecar 由进程退出时
+                // 的 kill-on-close Job 兜底回收（audit P1-3）。
+                let _ = std::fs::remove_file(files.current());
+                let _ = std::fs::remove_file(files.cancel_request());
                 let _ = std::io::stdout().flush();
                 std::process::exit(code);
             }
@@ -1237,6 +1351,14 @@ fn command_cancel(args: &Args) -> i32 {
         eprintln!("没有正在运行的 mash-cli run");
         return EXIT_ERROR;
     };
+    let pid = current["pid"].as_u64().unwrap_or(0) as u32;
+    if pid == 0 || !pid_alive(pid) {
+        // Audit P0-1: stale record after a hard kill/crash — clean up and
+        // fail with a clear message instead of waiting on a dead run.
+        clear_stale_run(&files);
+        eprintln!("检测到陈旧 run 记录（pid {pid}，进程已退出），已清理；无正在运行的 run");
+        return EXIT_ERROR;
+    }
     let mode = if args.flag("after-current") {
         "after-current"
     } else {
@@ -1246,9 +1368,10 @@ fn command_cancel(args: &Args) -> i32 {
         eprintln!("写入取消请求失败: {message}");
         return EXIT_ERROR;
     }
-    if let Err(message) = std::fs::write(
-        files.cancel_request(),
-        json!({ "mode": mode }).to_string(),
+    if let Err(message) = crate::storage::write_json_atomic(
+        &files.cancel_request(),
+        &json!({ "mode": mode }),
+        "取消请求",
     ) {
         eprintln!("写入取消请求失败: {message}");
         return EXIT_ERROR;
@@ -1278,15 +1401,30 @@ fn command_cancel(args: &Args) -> i32 {
 fn command_status(args: &Args) -> i32 {
     let files = CliRunFiles::new(&standalone_app_data_dir());
     let current = read_json(&files.current());
+    // Audit P0-1: liveness-check the recorded PID instead of trusting file
+    // presence; a stale record is reported as such and cleaned up.
+    let mut running = false;
+    let mut stale = false;
+    if let Some(record) = current.as_ref() {
+        let pid = record["pid"].as_u64().unwrap_or(0) as u32;
+        if pid != 0 && pid_alive(pid) {
+            running = true;
+        } else {
+            stale = true;
+            clear_stale_run(&files);
+        }
+    }
     let last_run = read_json(&files.last_run());
+    let current_for_payload = current.clone().filter(|_| running);
     let payload = json!({
-        "running": current.is_some(),
-        "current": current,
+        "running": running,
+        "stale": stale,
+        "current": current_for_payload,
         "lastRun": last_run,
     });
     if args.flag("json") {
         print_json(&payload, args);
-    } else if let Some(current) = &current {
+    } else if let Some(current) = current.as_ref().filter(|_| running) {
         println!(
             "running: runId={} project={} pid={} startedAt={}",
             current["runId"].as_str().unwrap_or("?"),
@@ -1294,15 +1432,20 @@ fn command_status(args: &Args) -> i32 {
             current["pid"].as_u64().unwrap_or(0),
             current["startedAt"].as_str().unwrap_or("?")
         );
-    } else if let Some(last_run) = &last_run {
-        println!(
-            "idle: lastRun outcome={} completedRuns={} endedAt={}",
-            last_run["outcome"].as_str().unwrap_or("?"),
-            last_run["completedRuns"].as_u64().unwrap_or(0),
-            last_run["endedAt"].as_str().unwrap_or("?")
-        );
     } else {
-        println!("idle: 尚无 run 记录");
+        if stale {
+            println!("idle: 检测并清理了陈旧 run 记录");
+        }
+        if let Some(last_run) = payload.get("lastRun").filter(|value| !value.is_null()) {
+            println!(
+                "idle: lastRun outcome={} completedRuns={} endedAt={}",
+                last_run["outcome"].as_str().unwrap_or("?"),
+                last_run["completedRuns"].as_u64().unwrap_or(0),
+                last_run["endedAt"].as_str().unwrap_or("?")
+            );
+        } else {
+            println!("idle: 尚无 run 记录");
+        }
     }
     EXIT_OK
 }
@@ -1370,6 +1513,39 @@ mod tests {
         assert_eq!(args.value("server"), Some("cn"));
         assert_eq!(args.value("repeat"), Some("count:3"));
         assert!(args.flag("json"));
+    }
+
+    #[test]
+    fn own_pid_is_reported_alive() {
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn missing_current_run_reads_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = CliRunFiles::new(dir.path());
+        assert!(read_current_run(&files).is_none());
+    }
+
+    #[test]
+    fn stale_current_run_detected_by_dead_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = CliRunFiles::new(dir.path());
+        std::fs::create_dir_all(&files.root).unwrap();
+        // PID 4_000_000 极不可能存活（Windows PID 分配范围远小于此），
+        // 用于模拟硬杀/崩溃后残留的陈旧记录（audit P0-1）。
+        crate::storage::write_json_atomic(
+            &files.current(),
+            &json!({ "pid": 4_000_000_u64, "runId": "stale" }),
+            "测试 run 记录",
+        )
+        .unwrap();
+        let (record, live) = read_current_run(&files).expect("记录应可读");
+        assert!(!live, "死 PID 必须判定为陈旧");
+        assert_eq!(record["runId"].as_str(), Some("stale"));
+        clear_stale_run(&files);
+        assert!(!files.current().exists());
+        assert!(!files.cancel_request().exists());
     }
 
     #[test]

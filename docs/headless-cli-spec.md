@@ -22,7 +22,7 @@ mash-cli run       --project <id> [--device <serial>] [--server cn|jp]
                    [--repeat infinite|count:<N>] [--ap-items gold:2,silver:*]
                    [--result-file <path>] [--events ndjson|none]
                    [--watchdog <seconds>] [--json]
-mash-cli cancel    [--after-current] [--run-dir <dir>]
+mash-cli cancel    [--after-current] [--wait <seconds>]
 mash-cli status    [--json]
 ```
 
@@ -86,8 +86,8 @@ mash-cli status    [--json]
 {
   "schemaVersion": 1,
   "runId": "6f1c…",
-  "startedAt": "2026-10-24T09:00:00+08:00",
-  "endedAt": "2026-10-24T09:21:33+08:00",
+  "startedAt": "2026-10-24T01:00:00Z",
+  "endedAt": "2026-10-24T01:21:33Z",
   "outcome": "finished",            // finished | error | cancelled | startup-failed | timeout
   "runnerState": "Finished",        // Finished | Error{message} | Idle | Starting
   "message": null,                  // error/cancel 时的人类可读原因
@@ -113,7 +113,7 @@ Exit codes（Orchestrator 判据）：
 
 ## 4. `cancel` —— 优雅取消正在运行的 run
 
-- 机制：`run` 启动时写 `<appDataDir>/cli/current.json`（pid、runId、project、startedAt）并每 500ms 轮询 `cli/cancel.request`。
+- 机制：`run` 启动时写 `<appDataDir>/cli/current.json`（pid、runId、project、startedAt）并每 300ms 轮询 `cli/cancel.request`。
 - `mash-cli cancel`：写 `cancel.request` = `{"mode":"immediate"}`，等目标进程退出（`--wait <secs>`，默认 30）。
 - `mash-cli cancel --after-current`：`{"mode":"after-current"}` → 对应 `stop_automation_after_current`（当前局打完再停，终态仍算 `finished`，completedRuns 为实际值）。
 - Ctrl+C（SIGINT/CTRL_C_EVENT）等价 immediate cancel。
@@ -135,7 +135,7 @@ Exit codes（Orchestrator 判据）：
 | Orchestrator 概念 | mash-cli |
 |---|---|
 | `AutomationRuntime::validate` | `validate --project <id>` |
-| `AutomationRuntime::run` | `run --project <id> --device <serial> --result-file <path> --events ndjson`（长驻进程，Orchestrator 读 stdout 事件流） |
+| `AutomationRuntime::run` | `run --project <id> --device <serial> --result-file <path> --events ndjson`（长驻进程；Orchestrator v1 以退出码 + result-file 为裁决依据，stdout 事件流供人工排查与未来的实时监控，v1 不做流式解析） |
 | `AutomationRuntime::cancel` | `cancel [--after-current]` |
 | `AutomationRuntime::status` | `status` / run 进程存活探测 + result-file |
 
